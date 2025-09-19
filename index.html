@@ -1,0 +1,372 @@
+<!--
+Page: index.html
+Purpose: Main reconciliation UI with real-time interaction.
+Contracts: LayoutDTO, MatchResultDTO, ReconciliationStatusDTO; {ok,data,error} response envelope.
+Security: Use <?= ... ?> for data; <?!= include(...) ?> only for trusted partials.
+-->
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <?!= include('partials'); ?>
+  </head>
+  <body>
+    <main class="container">
+      <header class="header">
+        <h1>Bank Reconciliation System</h1>
+        <div class="status-bar">
+          <span id="statusText" class="status-text">Initializing...</span>
+          <div class="header-actions">
+            <button id="btnBuildSheet" class="btn-primary">Build Sheet</button>
+            <button id="btnLoadStatus" class="btn-secondary">Load Status</button>
+            <button id="btnAutoMatch" class="btn-success" disabled>Auto-Match</button>
+            <button id="btnCloseMonth" class="btn-danger" disabled>Close Month</button>
+          </div>
+        </div>
+      </header>
+
+      <section id="summarySection" class="summary-section hidden">
+        <div class="summary-grid">
+          <div class="summary-card">
+            <h3>Check Register</h3>
+            <div class="summary-value" id="checkCount">-</div>
+            <div class="summary-label">Unmatched Items</div>
+          </div>
+          <div class="summary-card">
+            <h3>Bank CSV</h3>
+            <div class="summary-value" id="bankCount">-</div>
+            <div class="summary-label">Unmatched Items</div>
+          </div>
+          <div class="summary-card">
+            <h3>Variance</h3>
+            <div class="summary-value" id="variance">$0.00</div>
+            <div class="summary-label" id="varianceLabel">Difference</div>
+          </div>
+          <div class="summary-card">
+            <h3>Status</h3>
+            <div class="summary-value" id="balanceStatus">-</div>
+            <div class="summary-label">Ready to Close</div>
+          </div>
+        </div>
+      </section>
+
+      <section id="configSection" class="config-section hidden">
+        <h3>Auto-Match Configuration</h3>
+        <div class="config-grid">
+          <label class="config-option">
+            <input type="checkbox" id="enableTier1" checked>
+            <span class="config-label">Tier 1: Exact date + amount + description match</span>
+            <span class="config-desc">Highest confidence matches</span>
+          </label>
+          <label class="config-option">
+            <input type="checkbox" id="enableTier2" checked>
+            <span class="config-label">Tier 2: Date ±7 days + amount + description match</span>
+            <span class="config-desc">Accounts for processing delays</span>
+          </label>
+          <label class="config-option">
+            <input type="checkbox" id="enableTier3" checked>
+            <span class="config-label">Tier 3: Date ±30 days + amount + description match</span>
+            <span class="config-desc">Extended date range for delayed items</span>
+          </label>
+        </div>
+      </section>
+
+      <section id="resultsSection" class="results-section hidden">
+        <h3>Auto-Match Results</h3>
+        <div class="results-grid">
+          <div class="result-card tier1">
+            <h4>Tier 1 Matches</h4>
+            <div class="result-count" id="tier1Count">0</div>
+            <div class="result-desc">High Confidence</div>
+          </div>
+          <div class="result-card tier2">
+            <h4>Tier 2 Matches</h4>
+            <div class="result-count" id="tier2Count">0</div>
+            <div class="result-desc">Date Variance</div>
+          </div>
+          <div class="result-card tier3">
+            <h4>Tier 3 Matches</h4>
+            <div class="result-count" id="tier3Count">0</div>
+            <div class="result-desc">Extended Range</div>
+          </div>
+          <div class="result-card total">
+            <h4>Total Matches</h4>
+            <div class="result-count" id="totalMatches">0</div>
+            <div class="result-desc">All Tiers</div>
+          </div>
+        </div>
+      </section>
+
+      <section id="instructionsSection" class="instructions-section">
+        <h3>Instructions</h3>
+        <div class="instructions-grid">
+          <div class="instruction-card">
+            <h4>1. Build Reconciliation Sheet</h4>
+            <p>Create the worksheet structure with all sections and formulas.</p>
+          </div>
+          <div class="instruction-card">
+            <h4>2. Load Current Status</h4>
+            <p>Get unmatched items from Check Register and Bank CSV sheets.</p>
+          </div>
+          <div class="instruction-card">
+            <h4>3. Configure Auto-Match</h4>
+            <p>Select which tiers to enable for automated matching.</p>
+          </div>
+          <div class="instruction-card">
+            <h4>4. Run Auto-Match</h4>
+            <p>Execute automated matching algorithm with selected criteria.</p>
+          </div>
+          <div class="instruction-card">
+            <h4>5. Manual Matching</h4>
+            <p>In the reconciliation sheet, enter Transaction IDs in Status column for manual matches.</p>
+          </div>
+          <div class="instruction-card">
+            <h4>6. Close Month</h4>
+            <p>When variance is $0.00, close the month to auto-match remaining bank items.</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      function runServer(fn, ...args) {
+        return new Promise((resolve, reject) => {
+          google.script.run.withSuccessHandler(resolve)
+                           .withFailureHandler(reject)[fn](...args);
+        });
+      }
+
+      // State management
+      const state = {
+        sheetBuilt: false,
+        statusLoaded: false,
+        currentData: null,
+        autoMatchResults: null
+      };
+
+      // DOM elements
+      const elements = {
+        statusText: document.getElementById('statusText'),
+        btnBuildSheet: document.getElementById('btnBuildSheet'),
+        btnLoadStatus: document.getElementById('btnLoadStatus'),
+        btnAutoMatch: document.getElementById('btnAutoMatch'),
+        btnCloseMonth: document.getElementById('btnCloseMonth'),
+        summarySection: document.getElementById('summarySection'),
+        configSection: document.getElementById('configSection'),
+        resultsSection: document.getElementById('resultsSection'),
+        checkCount: document.getElementById('checkCount'),
+        bankCount: document.getElementById('bankCount'),
+        variance: document.getElementById('variance'),
+        varianceLabel: document.getElementById('varianceLabel'),
+        balanceStatus: document.getElementById('balanceStatus'),
+        enableTier1: document.getElementById('enableTier1'),
+        enableTier2: document.getElementById('enableTier2'),
+        enableTier3: document.getElementById('enableTier3'),
+        tier1Count: document.getElementById('tier1Count'),
+        tier2Count: document.getElementById('tier2Count'),
+        tier3Count: document.getElementById('tier3Count'),
+        totalMatches: document.getElementById('totalMatches')
+      };
+
+      // Event listeners
+      elements.btnBuildSheet.addEventListener('click', onBuildSheetClick);
+      elements.btnLoadStatus.addEventListener('click', onLoadStatusClick);
+      elements.btnAutoMatch.addEventListener('click', onAutoMatchClick);
+      elements.btnCloseMonth.addEventListener('click', onCloseMonthClick);
+
+      /**
+       * Handle build sheet button click.
+       */
+      async function onBuildSheetClick() {
+        try {
+          setStatus('Building reconciliation sheet...', 'loading');
+          elements.btnBuildSheet.disabled = true;
+          
+          const res = await runServer('buildReconciliationWorksheet');
+          
+          if (res.ok) {
+            state.sheetBuilt = true;
+            setStatus('Reconciliation sheet built successfully', 'success');
+            updateButtonStates();
+          } else {
+            throw new Error(res.error.message);
+          }
+          
+        } catch (err) {
+          setStatus(`Build failed: ${err.message}`, 'error');
+        } finally {
+          elements.btnBuildSheet.disabled = false;
+        }
+      }
+
+      /**
+       * Handle load status button click.
+       */
+      async function onLoadStatusClick() {
+        try {
+          setStatus('Loading reconciliation status...', 'loading');
+          elements.btnLoadStatus.disabled = true;
+          
+          const res = await runServer('getReconciliationStatus');
+          
+          if (res.ok) {
+            state.statusLoaded = true;
+            state.currentData = res.data;
+            updateSummaryDisplay(res.data);
+            setStatus('Status loaded successfully', 'success');
+            updateButtonStates();
+          } else {
+            throw new Error(res.error.message);
+          }
+          
+        } catch (err) {
+          setStatus(`Load failed: ${err.message}`, 'error');
+        } finally {
+          elements.btnLoadStatus.disabled = false;
+        }
+      }
+
+      /**
+       * Handle auto-match button click.
+       */
+      async function onAutoMatchClick() {
+        try {
+          setStatus('Executing auto-match process...', 'loading');
+          elements.btnAutoMatch.disabled = true;
+          
+          const criteria = {
+            enableTier1: elements.enableTier1.checked,
+            enableTier2: elements.enableTier2.checked,
+            enableTier3: elements.enableTier3.checked
+          };
+          
+          const res = await runServer('executeAutoMatch', criteria);
+          
+          if (res.ok) {
+            state.autoMatchResults = res.data;
+            updateResultsDisplay(res.data);
+            setStatus(`Auto-match complete: ${res.data.summary.totalMatches} matches found`, 'success');
+            
+            // Refresh status after matching
+            await onLoadStatusClick();
+          } else {
+            throw new Error(res.error.message);
+          }
+          
+        } catch (err) {
+          setStatus(`Auto-match failed: ${err.message}`, 'error');
+        } finally {
+          elements.btnAutoMatch.disabled = false;
+        }
+      }
+
+      /**
+       * Handle close month button click.
+       */
+      async function onCloseMonthClick() {
+        if (!confirm('Close the month? This will auto-match all remaining Bank CSV items and finalize the reconciliation.')) {
+          return;
+        }
+        
+        try {
+          setStatus('Processing month-end close...', 'loading');
+          elements.btnCloseMonth.disabled = true;
+          
+          const res = await runServer('closeMonth');
+          
+          if (res.ok) {
+            setStatus('Month closed successfully!', 'success');
+            showCloseResults(res.data);
+          } else {
+            throw new Error(res.error.message);
+          }
+          
+        } catch (err) {
+          setStatus(`Close failed: ${err.message}`, 'error');
+        } finally {
+          elements.btnCloseMonth.disabled = false;
+        }
+      }
+
+      /**
+       * Update summary display with current data.
+       * @param {Object} data
+       */
+      function updateSummaryDisplay(data) {
+        elements.checkCount.textContent = data.summary.checkRegisterCount;
+        elements.bankCount.textContent = data.summary.bankCsvCount;
+        elements.variance.textContent = formatCurrency(data.variance);
+        
+        if (data.summary.isBalanced) {
+          elements.balanceStatus.textContent = 'YES';
+          elements.balanceStatus.className = 'summary-value balanced';
+          elements.varianceLabel.textContent = 'Balanced';
+        } else {
+          elements.balanceStatus.textContent = 'NO';
+          elements.balanceStatus.className = 'summary-value unbalanced';
+          elements.varianceLabel.textContent = 'Needs Resolution';
+        }
+        
+        elements.summarySection.classList.remove('hidden');
+        elements.configSection.classList.remove('hidden');
+      }
+
+      /**
+       * Update results display with auto-match data.
+       * @param {Object} data
+       */
+      function updateResultsDisplay(data) {
+        elements.tier1Count.textContent = data.summary.tier1Count;
+        elements.tier2Count.textContent = data.summary.tier2Count;
+        elements.tier3Count.textContent = data.summary.tier3Count;
+        elements.totalMatches.textContent = data.summary.totalMatches;
+        
+        elements.resultsSection.classList.remove('hidden');
+      }
+
+      /**
+       * Show close results.
+       * @param {Object} data
+       */
+      function showCloseResults(data) {
+        alert(`Month closed successfully!\n\nAuto-matched items: ${data.autoMatchedItems}\nCarry-forward items: ${data.carryForwardItems}\nFinal variance: $${data.finalVariance.toFixed(2)}`);
+      }
+
+      /**
+       * Update button states based on current progress.
+       */
+      function updateButtonStates() {
+        elements.btnLoadStatus.disabled = !state.sheetBuilt;
+        elements.btnAutoMatch.disabled = !state.statusLoaded || 
+          (state.currentData && state.currentData.summary.totalUnmatched === 0);
+        elements.btnCloseMonth.disabled = !state.statusLoaded || 
+          (state.currentData && !state.currentData.summary.isBalanced);
+      }
+
+      /**
+       * Set status message and type.
+       * @param {string} message
+       * @param {string} type
+       */
+      function setStatus(message, type = 'info') {
+        elements.statusText.textContent = message;
+        elements.statusText.className = `status-text ${type}`;
+      }
+
+      /**
+       * Format currency value.
+       * @param {number} amount
+       * @returns {string}
+       */
+      function formatCurrency(amount) {
+        return new Intl.NumberFormat('en-US', {
+          style: 'currency',
+          currency: 'USD'
+        }).format(amount || 0);
+      }
+
+      // Initialize
+      updateButtonStates();
+    </script>
+  </body>
+</html>

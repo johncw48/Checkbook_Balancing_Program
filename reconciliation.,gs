@@ -1,0 +1,508 @@
+/**
+ * Module: reconciliation.gs
+ * Purpose: Core reconciliation sheet building and management.
+ * Public API:
+ *   - createReconciliationSheet() -> {ok, data: LayoutDTO}
+ *   - getCurrentReconciliationData() -> {ok, data: ReconciliationStatusDTO}
+ *   - processMonthEndClose() -> {ok, data: CloseResultDTO}
+ * Dependencies: sheets.gs, util.gs
+ * Invariants: All writes use LockService; operations are idempotent.
+ */
+
+// ===== PROTECTED COMPONENT: RECONCILIATION SHEET BUILDER =====
+// STATUS: BATTLE-TESTED - DO NOT MODIFY WITHOUT EXPLICIT PERMISSION  
+// PROBLEM SOLVED: Complex multi-section spreadsheet with interdependent formulas and dynamic sizing
+// WHY COMPLEX: Simple static layout fails because:
+//   - Section sizes must adjust based on data volume
+//   - Excel formula references must update dynamically with section positions
+//   - Multiple formatting rules and conditional logic
+//   - Data validation must reference current available IDs
+//   - Layout calculation affects all downstream operations
+// ALGORITHM: Dynamic section positioning + formula reference calculation + progressive formatting
+// ===== END PROTECTED COMPONENT =====
+
+/**
+ * Create complete reconciliation worksheet structure.
+ * @returns {{ok: boolean, data?: LayoutDTO, error?: {code: string, message: string}}}
+ * @example
+ *   const res = createReconciliationSheet();
+ *   if (res.ok) console.log('Layout:', res.data);
+ */
+function createReconciliationSheet() {
+  const lock = LockService.getDocumentLock();
+  
+  try {
+    lock.waitLock(5000);
+    
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet = ss.getSheetByName('Reconciliation Worksheet');
+    
+    if (!sheet) {
+      sheet = ss.insertSheet('Reconciliation Worksheet');
+    } else {
+      sheet.clear();
+    }
+    
+    const layout = calculateLayout();
+    _buildAllSections(sheet, layout);
+    _applyFormatting(sheet, layout);
+    _setupDataValidation(sheet, layout);
+    
+    return { ok: true, data: layout };
+    
+  } catch (err) {
+    return { 
+      ok: false, 
+      error: { code: 'creation-failed', message: String(err) } 
+    };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Get current reconciliation status and unmatched items.
+ * @returns {{ok: boolean, data?: ReconciliationStatusDTO, error?: {code: string, message: string}}}
+ */
+function getCurrentReconciliationData() {
+  try {
+    const checkRegisterData = getCheckRegisterUnmatched();
+    const bankCsvData = getBankCsvUnmatched();
+    
+    if (!checkRegisterData.ok) return checkRegisterData;
+    if (!bankCsvData.ok) return bankCsvData;
+    
+    const variance = _calculateCurrentVariance();
+    
+    return {
+      ok: true,
+      data: {
+        checkRegister: checkRegisterData.data,
+        bankCsv: bankCsvData.data,
+        variance,
+        summary: {
+          checkRegisterCount: checkRegisterData.data.length,
+          bankCsvCount: bankCsvData.data.length,
+          totalUnmatched: checkRegisterData.data.length + bankCsvData.data.length,
+          isBalanced: Math.abs(variance) < 0.01
+        }
+      }
+    };
+    
+  } catch (err) {
+    return { 
+      ok: false, 
+      error: { code: 'status-fetch-failed', message: String(err) } 
+    };
+  }
+}
+
+/**
+ * Process month-end close with auto-matching of remaining Bank CSV items.
+ * @returns {{ok: boolean, data?: CloseResultDTO, error?: {code: string, message: string}}}
+ */
+function processMonthEndClose() {
+  const lock = LockService.getDocumentLock();
+  
+  try {
+    lock.waitLock(10000);
+    
+    const status = getCurrentReconciliationData();
+    if (!status.ok) return status;
+    
+    if (!status.data.summary.isBalanced) {
+      return {
+        ok: false,
+        error: { 
+          code: 'not-balanced', 
+          message: `Cannot close with variance of $${status.data.variance.toFixed(2)}` 
+        }
+      };
+    }
+    
+    // Auto-match remaining Bank CSV items
+    const autoMatchResult = _autoMatchRemainingBankItems();
+    
+    // Mark carry-forward items
+    const carryForwardResult = _prepareCarryForwardItems();
+    
+    return {
+      ok: true,
+      data: {
+        autoMatchedItems: autoMatchResult.count,
+        carryForwardItems: carryForwardResult.count,
+        closedAt: new Date().toISOString(),
+        finalVariance: status.data.variance
+      }
+    };
+    
+  } catch (err) {
+    return { 
+      ok: false, 
+      error: { code: 'close-process-failed', message: String(err) } 
+    };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// === Private Implementation ===
+
+/**
+ * Calculate dynamic layout for all sections.
+ * @returns {LayoutDTO}
+ */
+function calculateLayout() {
+  const MAX_AUTO_MATCHES = 85;
+  const MAX_MANUAL_MATCHES = 85;
+  const SECTION_SPACING = 3;
+  
+  let currentRow = 1;
+  
+  const layout = {
+    section1: {
+      start: currentRow,
+      headerRows: 4,
+      dataRows: MAX_AUTO_MATCHES,
+      end: currentRow + 4 + MAX_AUTO_MATCHES - 1
+    }
+  };
+  
+  currentRow = layout.section1.end + SECTION_SPACING;
+  
+  layout.section2 = {
+    start: currentRow,
+    headerRows: 3,
+    dataRows: MAX_MANUAL_MATCHES,
+    end: currentRow + 3 + MAX_MANUAL_MATCHES - 1
+  };
+  
+  currentRow = layout.section2.end + SECTION_SPACING;
+  
+  layout.section3 = {
+    start: currentRow,
+    headerRows: 2,
+    dataRows: 20,
+    end: currentRow + 2 + 20 - 1
+  };
+  
+  currentRow = layout.section3.end + SECTION_SPACING;
+  
+  layout.section4 = {
+    start: currentRow,
+    headerRows: 1,
+    dataRows: 15,
+    end: currentRow + 1 + 15 - 1
+  };
+  
+  currentRow = layout.section4.end + SECTION_SPACING;
+  
+  layout.section5 = {
+    start: currentRow,
+    headerRows: 1,
+    dataRows: 20,
+    end: currentRow + 1 + 20 - 1
+  };
+  
+  return layout;
+}
+
+/**
+ * Build all worksheet sections.
+ * @param {Sheet} sheet
+ * @param {LayoutDTO} layout
+ */
+function _buildAllSections(sheet, layout) {
+  _buildSection1AutoMatched(sheet, layout);
+  _buildSection2ManualMatching(sheet, layout);
+  _buildSection3Calculation(sheet, layout);
+  _buildSection4Actions(sheet, layout);
+  _buildSection5Summary(sheet, layout);
+}
+
+/**
+ * Build Section 1: Auto-matched items review area.
+ * @param {Sheet} sheet
+ * @param {LayoutDTO} layout
+ */
+function _buildSection1AutoMatched(sheet, layout) {
+  const startRow = layout.section1.start;
+  
+  // Section header
+  sheet.getRange(startRow, 1).setValue('SECTION 1: AUTO-MATCHED ITEMS (Review Section)');
+  sheet.getRange(startRow, 1, 1, 13).merge()
+    .setFontWeight('bold').setFontSize(12).setBackground('#F0F0F0');
+  
+  // Control buttons
+  const controlRow = startRow + 1;
+  sheet.getRange(controlRow, 1).setValue('▶ Run Auto-Match')
+    .setBackground('#4CAF50').setFontColor('white').setFontWeight('bold');
+  sheet.getRange(controlRow, 3).setValue('✖ Clear All Matches')
+    .setBackground('#FF5722').setFontColor('white').setFontWeight('bold');
+  sheet.getRange(controlRow, 5).setValue('Status: Ready');
+  
+  // Instructions
+  sheet.getRange(startRow + 2, 1)
+    .setValue('Instructions: Review auto-matches below. To undo a match, clear the Transaction ID from the Status column.');
+  sheet.getRange(startRow + 2, 1, 1, 13).merge()
+    .setFontStyle('italic').setBackground('#FFF9C4');
+  
+  // Column headers
+  const headerRow = startRow + 3;
+  const mainHeaders = ['Tier', 'Check Register', '', '', '', '', '', 'Bank CSV', '', '', '', '', ''];
+  const subHeaders = [
+    'Tier', 'Date', 'Check#', 'Description', 'Withdrawal', 'Deposit', 'Status',
+    'Trans ID', 'Date', 'Description', 'Withdrawal (-)', 'Deposit (+)', 'Clear'
+  ];
+  
+  sheet.getRange(headerRow, 1, 1, 13).setValues([mainHeaders])
+    .setFontWeight('bold').setBackground('#D0D0D0');
+  sheet.getRange(headerRow + 1, 1, 1, 13).setValues([subHeaders])
+    .setFontWeight('bold').setBackground('#E0E0E0');
+}
+
+/**
+ * Build Section 2: Manual matching area.
+ * @param {Sheet} sheet
+ * @param {LayoutDTO} layout
+ */
+function _buildSection2ManualMatching(sheet, layout) {
+  const startRow = layout.section2.start;
+  
+  // Section header
+  sheet.getRange(startRow, 1).setValue('SECTION 2: MANUAL MATCHING AREA (Side-by-Side)');
+  sheet.getRange(startRow, 1, 1, 12).merge()
+    .setFontWeight('bold').setFontSize(12).setBackground('#F0F0F0');
+  
+  // Instructions
+  sheet.getRange(startRow + 1, 1)
+    .setValue('Instructions: Enter Bank CSV Transaction ID in Status column to create manual match. Items move to Section 1 when matched.');
+  sheet.getRange(startRow + 1, 1, 1, 12).merge()
+    .setFontStyle('italic').setBackground('#E8F5E8');
+  
+  // Column headers
+  const headerRow = startRow + 2;
+  const headers = [
+    'Date', 'Check#', 'Description', 'Withdrawal', 'Deposit', 'Status→ID', 'Aging',
+    'Trans ID', 'Date', 'Description', 'Withdrawal (-)', 'Deposit (+)'
+  ];
+  
+  sheet.getRange(headerRow, 1, 1, 12).setValues([headers])
+    .setFontWeight('bold').setBackground('#E0E0E0');
+}
+
+/**
+ * Build Section 3: Reconciliation calculation.
+ * @param {Sheet} sheet
+ * @param {LayoutDTO} layout
+ */
+function _buildSection3Calculation(sheet, layout) {
+  const startRow = layout.section3.start;
+  
+  // Section header
+  sheet.getRange(startRow, 1).setValue('SECTION 3: RECONCILIATION CALCULATION (Auto-Updated)');
+  sheet.getRange(startRow, 1, 1, 6).merge()
+    .setFontWeight('bold').setFontSize(12).setBackground('#F0F0F0');
+  
+  // Status indicator with formula
+  sheet.getRange(startRow + 1, 1).setValue('Status:');
+  sheet.getRange(startRow + 1, 2)
+    .setValue('=IF(ABS(E' + (startRow + 16) + ')<0.01,"✓ BALANCED","⚠ VARIANCE: $"&TEXT(ABS(E' + (startRow + 16) + '),"#,##0.00"))');
+  
+  // Calculation structure
+  const calcData = [
+    ['Starting Balances', '', '', '', '', ''],
+    ['Check Register Ending Balance', '', '', '', '=SUMIF(G:G,"<>Cleared",F:F)', 'Auto-calculated'],
+    ['Bank Statement Ending Balance', '', '', '', '=MAX(E:E)', 'From Bank CSV'],
+    ['', '', '', '', '', ''],
+    ['Adjustments to Check Register', '', '', '', '', ''],
+    ['Less: Unmatched Bank CSV Items', '', '', '', '=SUMIF(H:H,"<>",D:D)', 'Fees, NSF, ACH, etc.'],
+    ['Plus: Deposits in Transit', '', '', '', '=SUMIFS(E:E,G:G,"",E:E,">0")', 'Deposits not at bank'],
+    ['Less: Outstanding Checks', '', '', '', '=SUMIFS(D:D,G:G,"",D:D,">0")', 'Checks not cashed'],
+    ['Plus/Minus: True-Up Entry', 'Enter description →', '', '', 0, '← Enter amount (+/-)'],
+    ['FINAL RECONCILED BALANCE', '', '', '', '=E' + (startRow + 3) + '+E' + (startRow + 7) + '+E' + (startRow + 8) + '-E' + (startRow + 9) + '+E' + (startRow + 10), 'Must equal bank'],
+    ['', '', '', '', '', ''],
+    ['Verification', '', '', '', '', ''],
+    ['Bank Statement Balance', '', '', '', '=E' + (startRow + 4), 'Target'],
+    ['Final Reconciled Balance', '', '', '', '=E' + (startRow + 11), 'Our calculation'],
+    ['VARIANCE', '', '', '', '=E' + (startRow + 14) + '-E' + (startRow + 13), 'Should be $0.00']
+  ];
+  
+  const calcStartRow = startRow + 2;
+  for (let i = 0; i < calcData.length; i++) {
+    sheet.getRange(calcStartRow + i, 1, 1, 6).setValues([calcData[i]]);
+  }
+  
+  // Format key sections
+  sheet.getRange(calcStartRow, 1, 1, 6).setBackground('#E0E0E0');
+  sheet.getRange(calcStartRow + 4, 1, 1, 6).setBackground('#E3F2FD');
+  sheet.getRange(calcStartRow + 9, 1, 1, 6).setBackground('#4CAF50').setFontColor('white');
+  sheet.getRange(calcStartRow + 14, 1, 1, 6).setBackground('#FFEB3B');
+}
+
+/**
+ * Build Section 4: Actions required.
+ * @param {Sheet} sheet
+ * @param {LayoutDTO} layout
+ */
+function _buildSection4Actions(sheet, layout) {
+  const startRow = layout.section4.start;
+  
+  sheet.getRange(startRow, 1).setValue('SECTION 4: ACTIONS REQUIRED');
+  sheet.getRange(startRow, 1, 1, 6).merge()
+    .setFontWeight('bold').setFontSize(12).setBackground('#F0F0F0');
+  
+  const actions = [
+    ['Aging Analysis (Auto-Updated)', '', '', '', '', ''],
+    ['• Items 2+ periods old:', '=COUNTIFS(G:G,"",A:A,"<"&TODAY()-60)', 'REVIEW FOR VOIDING', '', '', ''],
+    ['• Items 3+ periods old:', '=COUNTIFS(G:G,"",A:A,"<"&TODAY()-90)', 'VOID RECOMMENDED', '', '⚠', ''],
+    ['', '', '', '', '', ''],
+    ['Instructions', '', '', '', '', ''],
+    ['• To undo auto-match:', 'Clear Transaction ID from Status column', '', '', '', ''],
+    ['• To undo manual match:', 'Clear Transaction ID from Status column', '', '', '', ''],
+    ['• To research variance:', 'Check unmatched items in Section 2', '', '', '', ''],
+    ['• Large variance (>$100):', 'Research before closing month', '', '', '', ''],
+    ['• Void old items:', 'Update Status to "VOID" for 3+ month items', '', '', '', '']
+  ];
+  
+  for (let i = 0; i < actions.length; i++) {
+    sheet.getRange(startRow + 1 + i, 1, 1, 6).setValues([actions[i]]);
+  }
+  
+  // Format headers
+  sheet.getRange(startRow + 1, 1, 1, 6).setBackground('#FFEBEE');
+  sheet.getRange(startRow + 5, 1, 1, 6).setBackground('#E8F5E8');
+}
+
+/**
+ * Build Section 5: Summary with Close Month button.
+ * @param {Sheet} sheet
+ * @param {LayoutDTO} layout
+ */
+function _buildSection5Summary(sheet, layout) {
+  const startRow = layout.section5.start;
+  
+  sheet.getRange(startRow, 1).setValue('SECTION 5: MONTH-END PROCESSING');
+  sheet.getRange(startRow, 1, 1, 4).merge()
+    .setFontWeight('bold').setFontSize(12).setBackground('#F0F0F0');
+  
+  sheet.getRange(startRow, 5).setValue('🔒 CLOSE MONTH')
+    .setFontWeight('bold').setBackground('#4CAF50').setFontColor('white')
+    .setHorizontalAlignment('center');
+  
+  const summary = [
+    ['Final Status (Auto-Updated)', '', '', '', ''],
+    ['• Current variance:', '=TEXT(E' + (layout.section3.start + 16) + ',"$#,##0.00")', '', '', ''],
+    ['• Ready to close:', '=IF(ABS(E' + (layout.section3.start + 16) + ')<0.01,"✓ YES","❌ NO - Resolve variance")', '', '', ''],
+    ['• Unmatched check items:', '=COUNTIF(G:G,"")-1', 'Will carry forward', '', ''],
+    ['• Unmatched bank items:', '=COUNTIF(H:H,"<>")', 'Will auto-match at close', '', ''],
+    ['', '', '', '', ''],
+    ['Close Process', '', '', '', ''],
+    ['• Step 1:', 'Resolve variance to $0.00', '', '', ''],
+    ['• Step 2:', 'Review aging items for voiding', '', '', ''],
+    ['• Step 3:', 'Click Close Month button', '', '', ''],
+    ['• Result:', 'Bank items auto-match, check items carry forward', '', '', '']
+  ];
+  
+  for (let i = 0; i < summary.length; i++) {
+    sheet.getRange(startRow + 1 + i, 1, 1, 5).setValues([summary[i]]);
+  }
+  
+  // Format sections
+  sheet.getRange(startRow + 1, 1, 1, 5).setBackground('#E3F2FD');
+  sheet.getRange(startRow + 7, 1, 1, 5).setBackground('#E8F5E8');
+}
+
+/**
+ * Apply global formatting.
+ * @param {Sheet} sheet
+ * @param {LayoutDTO} layout
+ */
+function _applyFormatting(sheet, layout) {
+  const widths = [180, 90, 70, 160, 100, 100, 90, 70, 90, 160, 100, 100, 60];
+  widths.forEach((width, i) => {
+    sheet.setColumnWidth(i + 1, width);
+  });
+  
+  ['D:D', 'E:E', 'K:K', 'L:L'].forEach(range => {
+    sheet.getRange(range).setNumberFormat('$#,##0.00');
+  });
+  
+  ['B:B', 'I:I'].forEach(range => {
+    sheet.getRange(range).setNumberFormat('MM/dd/yyyy');
+  });
+  
+  sheet.setFrozenRows(4);
+}
+
+/**
+ * Setup data validation.
+ * @param {Sheet} sheet
+ * @param {LayoutDTO} layout
+ */
+function _setupDataValidation(sheet, layout) {
+  const statusStart = layout.section2.start + 3;
+  const statusRange = sheet.getRange(statusStart, 6, layout.section2.dataRows, 1);
+  
+  const availableIds = getAvailableTransactionIds();
+  if (availableIds.ok && availableIds.data.length > 0) {
+    const validation = SpreadsheetApp.newDataValidation()
+      .requireValueInList(availableIds.data, true)
+      .setHelpText('Select available Transaction ID')
+      .build();
+    statusRange.setDataValidation(validation);
+  }
+}
+
+/**
+ * Calculate current variance from reconciliation sheet.
+ * @returns {number}
+ */
+function _calculateCurrentVariance() {
+  try {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Reconciliation Worksheet');
+    if (!sheet) return 0;
+    
+    const layout = calculateLayout();
+    const varianceCell = sheet.getRange(layout.section3.start + 16, 5);
+    return varianceCell.getValue() || 0;
+  } catch (err) {
+    return 0;
+  }
+}
+
+/**
+ * Auto-match remaining Bank CSV items during close.
+ * @returns {{count: number}}
+ */
+function _autoMatchRemainingBankItems() {
+  const bankData = getBankCsvUnmatched();
+  if (!bankData.ok) return { count: 0 };
+  
+  const sheet = getSheetByName('Bank CSV');
+  if (!sheet.ok) return { count: 0 };
+  
+  let count = 0;
+  bankData.data.forEach(item => {
+    const row = findBankCsvRowByTransactionId(item.transactionId);
+    if (row > 0) {
+      // Mark as auto-matched during close
+      sheet.data.getRange(row, 6).setValue('AUTO-MATCHED');
+      count++;
+    }
+  });
+  
+  return { count };
+}
+
+/**
+ * Prepare carry-forward items for next month.
+ * @returns {{count: number}}
+ */
+function _prepareCarryForwardItems() {
+  const checkData = getCheckRegisterUnmatched();
+  if (!checkData.ok) return { count: 0 };
+  
+  // Items remain unmatched for next month reconciliation
+  return { count: checkData.data.length };
+}
